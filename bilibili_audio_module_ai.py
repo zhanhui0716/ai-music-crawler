@@ -1,23 +1,27 @@
 # 文件保存为: bilibili_audio_module_ai.py
-import requests, os, re, json, threading, time, subprocess
-from bs4 import BeautifulSoup
+import json
+import re
+import shutil
+import subprocess
+import threading
+import time
 from urllib.parse import urlsplit
-from local_config import get_config
+
+import requests
+from bs4 import BeautifulSoup
+from local_config import APP_DIR, get_config
 
 
-# ---------- 你原有的所有工具函数 (sanitize_filename, download_large_file, print_dots, find_best_audio_stream, download_audio) ----------
-# 注意：为了节省篇幅，此处省略了这些函数的完整代码。你必须将上一个回复中 `bilibili_audio_module.py` 文件里，
-# 从 `def sanitize_filename(name):` 开始，到 `def download_audio(...):` 结束的所有函数定义，原封不动地复制粘贴到这里。
-# ---------- 以下是必须复制粘贴的原有函数列表 ----------
-# def sanitize_filename(name):
-# def download_large_file(url, filepath, headers, max_retry=3):
-# def print_dots(stop_event):
-# def search_bilibili_videos(keyword, max_results=10): # 这个函数特别重要！
-# def find_best_audio_stream(html_content):
-# def download_audio(keyword, url, stop_event):
-# ----------------------------------------------------
+AUDIO_DIR = APP_DIR / "B站下载的音频"
 
-# 安全文件名处理
+
+def ffmpeg_command():
+    local_ffmpeg = APP_DIR / "ffmpeg.exe"
+    if local_ffmpeg.is_file():
+        return str(local_ffmpeg)
+    return shutil.which("ffmpeg")
+
+
 def sanitize_filename(name):
     return re.sub(r'[\\/*?:"<>|]', "", name).strip()
 
@@ -26,7 +30,7 @@ def sanitize_filename(name):
 def download_large_file(url, filepath, headers, max_retry=3):
     for attempt in range(max_retry):
         try:
-            with requests.get(url, headers=headers, stream=True) as r:
+            with requests.get(url, headers=headers, stream=True, timeout=(10, 30)) as r:
                 r.raise_for_status()
                 total_size = int(r.headers.get('content-length', 0))
                 downloaded = 0
@@ -181,7 +185,7 @@ def find_best_audio_stream(html_content):
     }
 
 
-def download_audio(keyword, url, stop_event):
+def download_audio(keyword, url, output_dir=AUDIO_DIR):
     """下载音频文件，所有文件以keyword命名"""
     headers = {
         'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
@@ -196,16 +200,16 @@ def download_audio(keyword, url, stop_event):
             cookie = get_config("BILIBILI_COOKIE")
             if cookie:
                 page_headers["Cookie"] = cookie
-        res = requests.get(url, headers=page_headers)
+        res = requests.get(url, headers=page_headers, timeout=(10, 30))
         res.raise_for_status()
 
         audio_info = find_best_audio_stream(res.text)
         audio_url = audio_info['audio']['url']
 
         safe_name = sanitize_filename(keyword)
-        os.makedirs('B站下载的音频', exist_ok=True)
-        temp_file = f'B站下载的音频/{safe_name}_temp.m4s'
-        output_path = f'B站下载的音频/{safe_name}.m4a'
+        output_dir.mkdir(parents=True, exist_ok=True)
+        temp_file = output_dir / f'{safe_name}_temp.m4s'
+        output_path = output_dir / f'{safe_name}.m4a'
 
         print(f"正在下载音频流: {keyword}")
         if not download_large_file(audio_url, temp_file, headers):
@@ -222,8 +226,9 @@ def download_audio(keyword, url, stop_event):
         print(f"正在封装为标准音频文件: {keyword}")
         # 调用FFmpeg将.m4s封装为.m4a
         try:
-            result = subprocess.run(['ffmpeg', '-y', '-i', temp_file, '-c', 'copy', output_path], 
-                                   capture_output=True, text=False, timeout=30)
+            result = subprocess.run([ffmpeg_command() or 'ffmpeg', '-y', '-i', temp_file, '-c', 'copy', output_path],
+                                   capture_output=True, timeout=30,
+                                   creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         except subprocess.TimeoutExpired:
             print(f"FFmpeg封装超时（30s），跳过此文件。")
             return False
@@ -235,8 +240,8 @@ def download_audio(keyword, url, stop_event):
             return False
 
         # 删除临时文件
-        if os.path.exists(temp_file):
-            os.remove(temp_file)
+        if temp_file.exists():
+            temp_file.unlink()
             print(f"临时文件已删除: {temp_file}")
 
         return True
@@ -274,7 +279,7 @@ def search_and_list_videos(keyword):
     return {'keyword': keyword, 'videos': formatted_results}
 
 
-def download_selected_audio(task_info, selected_index):
+def download_selected_audio(task_info, selected_index, output_dir=AUDIO_DIR):
     """
     阶段二：根据AI选择的序号下载音频。
     :param task_info: 来自 search_and_list_videos 的返回字典
@@ -307,18 +312,17 @@ def download_selected_audio(task_info, selected_index):
     if download_url.startswith('/'):
         download_url = 'https://www.bilibili.com' + download_url
 
-    os.makedirs('B站下载的音频', exist_ok=True)  # 确保目录存在
-    success = download_audio(keyword, download_url, stop_event)
-
-    stop_event.set()
-    if dot_thread.is_alive():
+    try:
+        success = download_audio(keyword, download_url, output_dir)
+    finally:
+        stop_event.set()
         dot_thread.join(timeout=1)
 
     if success:
         msg = f"「{keyword}」音频下载完成！(基于AI选择：{selected_index})"
-        print(f"  ✅ {msg}")
+        print(f"  [OK] {msg}")
         return {'success': True, 'keyword': keyword, 'ai_choice': selected_index, 'message': msg}
     else:
         msg = f"「{keyword}」音频下载失败。"
-        print(f"  ❌ {msg}")
+        print(f"  [!] {msg}")
         return {'success': False, 'keyword': keyword, 'ai_choice': selected_index, 'message': msg}

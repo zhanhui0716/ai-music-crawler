@@ -1,9 +1,33 @@
 # AI Music Crawler
 
-按关键词搜索 B 站视频，由 DeepSeek 选择候选，并使用 FFmpeg 封装音频。
+Windows 桌面工具。输入歌曲名或搜索词，由 DeepSeek 根据 B 站搜索结果选择音源，再用 FFmpeg 封装成音频文件。
 
-1. 将 FFmpeg 加入 PATH，然后执行 `python -m pip install -r requirements.txt`。
-2. 在项目根目录复制 `secrets.example.txt` 为 `secrets.txt`，填入 `DEEPSEEK_API_KEY`。需要使用登录会话时，在 `BILIBILI_COOKIE` 中填入完整的 Cookie，保持单行。同名非空环境变量优先。
-3. 编辑 `keywords.txt`，每行一个关键词。从项目根目录执行 `python main_controller_ai_choice.py`。
+## Windows 便携版
 
-`secrets.txt` 是本地明文配置，已被 Git 忽略。提交示例文件时请保持凭据字段为空。
+1. 解压 `AI-Music-Crawler-Windows-x64.zip` 到有写入权限的目录。
+2. 将 `ffmpeg.exe` 放在解压目录，或将 FFmpeg 加入 PATH。便携版已包含 Python 运行时。
+3. 双击 `AI-Music-Crawler.exe`。打开左侧 **设置**，填写并保存自己的 DeepSeek API Key。B 站 Cookie 可选，填入时请使用单行的完整值。
+4. 回到 **下载任务**，在关键词框里每行输入一条，再点 **开始下载**。界面会保存 `keywords.txt` 并显示运行日志、进度和完成统计。
+5. 点击 **打开保存目录** 查看音频。桌面版的 `.m4a` 和日志文件保存在 EXE 旁边。
+
+凭据保存在同目录的本地明文 `secrets.txt`。同名非空环境变量优先。ZIP 内只有空白凭据模板。
+
+## 从源码运行
+
+```powershell
+python -m pip install -r requirements.txt
+pythonw desktop_app.pyw
+```
+
+原命令行入口仍可使用 `python main_controller_ai_choice.py`，其音频输出位于项目根目录下的 `B站下载的音频` 文件夹。
+
+## 构建与发布
+
+使用 Windows x64 Python，安装 `requirements.txt` 中的依赖，再执行以下命令。
+
+```powershell
+python -m pip install pyinstaller
+python build_windows.py
+```
+
+将本地 `dist/AI-Music-Crawler-Windows-x64.zip` 上传到 GitHub Release 的附件区。Git 忽略了凭据、音频、日志和构建输出。
