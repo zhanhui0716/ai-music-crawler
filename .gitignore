@@ -1,0 +1,6 @@
+/secrets.txt
+/.venv/
+__pycache__/
+*.py[cod]
+/ai_download_log.txt
+/B站下载的音频/
