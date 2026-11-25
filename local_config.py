@@ -42,10 +42,12 @@ def write_local_text(path, contents):
             temp_path.unlink(missing_ok=True)
 
 
-def save_credentials(api_key, cookie):
+def save_credentials(api_key, cookie, *, download_dir=None):
     values = (api_key.strip(), cookie.strip())
     if any("\r" in value or "\n" in value for value in values):
         raise ValueError("Each credential must be on one line.")
     config = read_local_config()
     config.update(zip(("DEEPSEEK_API_KEY", "BILIBILI_COOKIE"), values))
+    if download_dir is not None:
+        config["DOWNLOAD_DIR"] = download_dir
     write_local_text(SECRETS_FILE, "".join(f"{key}={value}\n" for key, value in config.items()))

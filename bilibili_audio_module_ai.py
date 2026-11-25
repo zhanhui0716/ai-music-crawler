@@ -3,13 +3,14 @@ import json
 import re
 import shutil
 import subprocess
-import threading
 import time
-from urllib.parse import urlsplit
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from urllib.parse import parse_qs, urljoin, urlsplit
 
 import requests
 from bs4 import BeautifulSoup
-from local_config import APP_DIR, get_config
+from local_config import APP_DIR, get_config, write_local_text
 
 
 AUDIO_DIR = APP_DIR / "B站下载的音频"
@@ -23,7 +24,10 @@ def ffmpeg_command():
 
 
 def sanitize_filename(name):
-    return re.sub(r'[\\/*?:"<>|]', "", name).strip()
+    safe_name = re.sub(r'[\\/*?:"<>|\x00-\x1f]', "", name).strip().rstrip(".")[:120].rstrip(". ") or "audio"
+    if safe_name.split(".")[0].upper() in {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}:
+        safe_name = "_" + safe_name
+    return safe_name
 
 
 # 带重试的流式下载
@@ -34,35 +38,37 @@ def download_large_file(url, filepath, headers, max_retry=3):
                 r.raise_for_status()
                 total_size = int(r.headers.get('content-length', 0))
                 downloaded = 0
+                last_update = 0
 
                 with open(filepath, 'wb') as f:
-                    for chunk in r.iter_content(chunk_size=8192):
+                    for chunk in r.iter_content(chunk_size=65536):
                         if chunk:
                             f.write(chunk)
                             downloaded += len(chunk)
-                            if total_size > 0:
+                            now = time.monotonic()
+                            if total_size > 0 and (now - last_update >= 0.25 or downloaded == total_size):
+                                last_update = now
                                 percent = downloaded / total_size * 100
                                 print(f"\r下载中: {percent:.1f}%", end='', flush=True)
-                print()  # 换行
+                print()
+                if not downloaded:
+                    raise requests.RequestException("Empty media response")
             return True
-        except Exception as e:
-            print(f"\n下载失败 ({attempt + 1}/{max_retry}): {e}")
-            time.sleep(2)  # 重试前等待
+        except requests.RequestException as error:
+            print(f"\n下载失败 ({attempt + 1}/{max_retry}): {type(error).__name__}")
+            if attempt + 1 < max_retry:
+                time.sleep(2)
     return False
 
 
-# 后台打印进度点
-def print_dots(stop_event):
-    """在后台打印进度点"""
-    while not stop_event.is_set():
-        print('.', end='', flush=True)
-        time.sleep(1)
+class SearchError(RuntimeError):
+    pass
 
 
 def search_bilibili_videos(keyword, max_results=10):
     """根据关键词搜索B站视频，返回前max_results个视频信息"""
     try:
-        url = f'https://search.bilibili.com/all?keyword={keyword}'
+        url = 'https://search.bilibili.com/all'
         headers = {
             'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 Edg/132.0.0.0',
             'referer': 'https://www.bilibili.com/',
@@ -70,7 +76,7 @@ def search_bilibili_videos(keyword, max_results=10):
         cookie = get_config("BILIBILI_COOKIE")
         if cookie:
             headers["Cookie"] = cookie
-        res = requests.get(url, headers=headers, timeout=10)
+        res = requests.get(url, params={"keyword": keyword}, headers=headers, timeout=10)
         res.raise_for_status()
         soup = BeautifulSoup(res.text, 'lxml')
         video_cards = soup.find_all('div', class_='bili-video-card')
@@ -118,71 +124,157 @@ def search_bilibili_videos(keyword, max_results=10):
             })
             count += 1
         return results
-    except requests.exceptions.RequestException as e:
-        print(f"网络请求失败: {e}")
-        return []
-    except Exception as e:
-        print(f"解析视频列表时出错: {e}")
-        import traceback
-        traceback.print_exc()
-        return []
+    except requests.HTTPError as error:
+        raise SearchError(f"B 站搜索返回 HTTP {error.response.status_code}。") from None
+    except requests.RequestException as error:
+        raise SearchError(f"B 站搜索请求失败 ({type(error).__name__})。") from None
+
 
 # 查找最高质量音频流
-def find_best_audio_stream(html_content):
-    """从HTML内容中提取最佳音频流信息"""
-    # 提取JSON数据
-    match = re.search(r'window\.__playinfo__\s*=\s*({.*?})\s*</script>', html_content, re.DOTALL)
+def find_audio_streams(html_content):
+    """Return the audio streams advertised for this playback session, in quality order."""
+    match = re.search(r"window\.__playinfo__\s*=\s*(?=\{)", html_content)
     if not match:
-        # 尝试备用匹配模式
-        match = re.search(r'<script>window\.__playinfo__\s*=\s*({.*?})</script>', html_content, re.DOTALL)
-        if not match:
-            raise ValueError("未找到视频信息")
+        raise ValueError("未找到视频播放信息")
 
-    playinfo = json.loads(match.group(1))
+    playinfo, _ = json.JSONDecoder().raw_decode(html_content, match.end())
+    data = playinfo.get("data") or {}
+    dash = data.get("dash") or {}
+    flac = (dash.get("flac") or {}).get("audio")
+    dolby = (dash.get("dolby") or {}).get("audio")
 
-    # 检查是否有dash格式数据
-    if 'data' not in playinfo or 'dash' not in playinfo['data']:
-        # 尝试从其他位置获取音频
-        if 'data' in playinfo and 'durl' in playinfo['data']:
-            # 处理非dash格式
-            durls = playinfo['data']['durl']
-            if durls:
-                # 选择最高质量的音频（按size排序）
-                best_audio = max(durls, key=lambda x: x.get('size', 0))
-                return {
-                    'audio': {
-                        'url': best_audio['url'],
-                        'backup_urls': best_audio.get('backup_url', []),
-                        'size': best_audio.get('size', 0)
-                    }
-                }
-        raise ValueError("不支持的音频格式")
+    groups = {"FLAC": [], "Dolby": [], "DASH": []}
+    for quality, entries in (
+        ("FLAC", flac),
+        ("Dolby", dolby),
+        ("DASH", dash.get("audio")),
+    ):
+        if isinstance(entries, dict):
+            entries = [entries]
+        for entry in entries or []:
+            codec = (entry.get("codecs") or "").lower()
+            category = quality
+            if codec.startswith("flac"):
+                category = "FLAC"
+            elif codec.startswith(("ec-3", "ac-3", "eac3")):
+                category = "Dolby"
+            groups[category].append(entry)
 
-    dash_data = playinfo['data']['dash']
+    extensions = {"FLAC": ".flac", "Dolby": ".mka", "DASH": ".m4a"}
+    candidates = []
+    seen = set()
+    for quality, entries in groups.items():
+        for entry in sorted(entries, key=lambda item: item.get("bandwidth") or 0, reverse=True):
+            url = entry.get("base_url") or entry.get("baseUrl")
+            backups = entry.get("backup_url") or entry.get("backupUrl") or []
+            urls = [value for value in (url, *backups) if value]
+            if not urls or urls[0] in seen:
+                continue
+            seen.add(urls[0])
+            candidates.append({
+                "url": urls[0],
+                "stream_id": entry.get("id"),
+                "backup_urls": urls[1:],
+                "bandwidth": entry.get("bandwidth") or 0,
+                "codec": entry.get("codecs") or "未知编码",
+                "quality": quality,
+                "extension": extensions[quality],
+            })
 
-    # 选择最高质量音频流（按带宽排序）
-    audio_streams = dash_data.get('audio', [])
-    if not audio_streams:
-        raise ValueError("未找到音频流")
+    if not candidates:
+        segments = data.get("durl") or []
+        segments = [segment for segment in segments if segment.get("url")]
+        if segments:
+            segment = max(segments, key=lambda item: item.get("size") or 0)
+            candidates.append({
+                "url": segment["url"],
+                "source_size": segment.get("size") or 0,
+                "backup_urls": segment.get("backup_url") or [],
+                "bandwidth": 0,
+                "codec": "未知编码",
+                "quality": "兼容音轨",
+                "extension": ".m4a",
+            })
+        else:
+            raise ValueError("未找到可用音轨")
+    return candidates
 
-    # 优先选择高比特率的音频
-    audio_streams.sort(key=lambda x: x.get('bandwidth', 0), reverse=True)
-    best_audio = audio_streams[0]
 
-    # 提取URL（兼容不同大小写键名）
-    audio_url = best_audio.get('base_url') or best_audio.get('baseUrl', '')
+def find_best_audio_stream(html_content):
+    return {"audio": find_audio_streams(html_content)[0]}
 
-    # 获取备用URL（如果存在）
-    backup_urls = best_audio.get('backup_url') or best_audio.get('backupUrl', [])
 
-    return {
-        'audio': {
-            'url': audio_url,
-            'backup_urls': backup_urls,
-            'bandwidth': best_audio.get('bandwidth', 0),
-            'codec': best_audio.get('codecs', '未知编码')
-        }
+def audio_cache_matches(output_path, receipt_path, source):
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        stat = output_path.stat()
+    except (OSError, ValueError):
+        return False
+    return (
+        isinstance(receipt, dict)
+        and output_path.is_file()
+        and receipt == {"source": source, "size": stat.st_size, "modified_ns": stat.st_mtime_ns}
+        and stat.st_size > 0
+    )
+
+
+def save_audio_stream(stream, ffmpeg, headers, work_dir, output_dir, filename, video):
+    extension = stream["extension"]
+    codec = stream["codec"]
+    bandwidth = stream["bandwidth"]
+    description = f"{stream['quality']} / {codec}"
+    if bandwidth:
+        description += f" / {bandwidth / 1000:.0f} kb/s"
+    output_path = output_dir / f"{filename}{extension}"
+    receipt_path = output_dir / ".music-crawler-cache" / f"{output_path.name}.json"
+    source = {
+        "video": video,
+        "media": urlsplit(stream["url"]).path.rsplit("/", 1)[-1],
+        "stream_id": stream.get("stream_id"),
+        "source_size": stream.get("source_size"),
+        "quality": stream["quality"],
+        "codec": codec,
+        "bandwidth": bandwidth,
+        "extension": extension,
     }
+    if audio_cache_matches(output_path, receipt_path, source):
+        print(f"已存在，跳过下载：{output_path.name}（{description}）")
+        return True
+    print(f"正在尝试音轨：{description}")
+
+    temp_file = work_dir / "download.m4s"
+    staged_output = work_dir / f"audio{extension}"
+    for index, media_url in enumerate([stream["url"], *stream["backup_urls"]]):
+        if index:
+            print("尝试备用下载地址。")
+        if not download_large_file(media_url, temp_file, headers):
+            continue
+        try:
+            result = subprocess.run(
+                [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i",
+                 temp_file, "-map", "0:a:0", "-c:a", "copy", staged_output],
+                capture_output=True, timeout=30,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except subprocess.TimeoutExpired:
+            print("FFmpeg 封装超时（30 秒）。")
+            continue
+        if result.returncode != 0:
+            print("封装失败: " + result.stderr.decode("utf-8", errors="replace").strip())
+            continue
+
+        completed = staged_output.stat()
+        staged_output.replace(output_path)
+        try:
+            receipt_path.parent.mkdir(exist_ok=True)
+            write_local_text(receipt_path, json.dumps({
+                "source": source, "size": completed.st_size, "modified_ns": completed.st_mtime_ns,
+            }, ensure_ascii=False))
+        except OSError:
+            print("音频已保存，但无法写入下载记录。")
+        print(f"已保存：{output_path.name}（{description}）")
+        return True
+    return False
 
 
 def download_audio(keyword, url, output_dir=AUDIO_DIR):
@@ -195,61 +287,35 @@ def download_audio(keyword, url, output_dir=AUDIO_DIR):
     try:
         print(f"正在获取音频信息: {keyword}")
         page_headers = headers.copy()
-        host = urlsplit(url).hostname or ""
-        if urlsplit(url).scheme == "https" and (host == "bilibili.com" or host.endswith(".bilibili.com")):
-            cookie = get_config("BILIBILI_COOKIE")
-            if cookie:
-                page_headers["Cookie"] = cookie
+        parsed = urlsplit(url)
+        host = parsed.hostname or ""
+        if parsed.scheme != "https" or not (host == "bilibili.com" or host.endswith(".bilibili.com")):
+            raise ValueError("非 B 站视频地址")
+        cookie = get_config("BILIBILI_COOKIE")
+        if cookie:
+            page_headers["Cookie"] = cookie
         res = requests.get(url, headers=page_headers, timeout=(10, 30))
         res.raise_for_status()
 
-        audio_info = find_best_audio_stream(res.text)
-        audio_url = audio_info['audio']['url']
+        streams = find_audio_streams(res.text)
+        page = parse_qs(parsed.query).get("p", ["1"])[0]
+        video = f"{parsed.path.rstrip('/')}?p={page}"
+        ffmpeg = ffmpeg_command()
+        if not ffmpeg:
+            raise ValueError("找不到 FFmpeg")
 
-        safe_name = sanitize_filename(keyword)
         output_dir.mkdir(parents=True, exist_ok=True)
-        temp_file = output_dir / f'{safe_name}_temp.m4s'
-        output_path = output_dir / f'{safe_name}.m4a'
+        filename = sanitize_filename(keyword)
+        with TemporaryDirectory(prefix=".music-crawler-", dir=output_dir) as work_dir:
+            for stream in streams:
+                if save_audio_stream(stream, ffmpeg, headers, Path(work_dir), output_dir, filename, video):
+                    return True
+        print("所有可用音轨均下载或封装失败。")
+        return False
 
-        print(f"正在下载音频流: {keyword}")
-        if not download_large_file(audio_url, temp_file, headers):
-            if 'backup_urls' in audio_info['audio'] and audio_info['audio']['backup_urls']:
-                print("尝试使用备用URL下载...")
-                for backup_url in audio_info['audio']['backup_urls']:
-                    print(f"尝试备用URL: {backup_url}")
-                    if download_large_file(backup_url, temp_file, headers):
-                        break
-                else:
-                    return False
-            else:
-                return False
-        print(f"正在封装为标准音频文件: {keyword}")
-        # 调用FFmpeg将.m4s封装为.m4a
-        try:
-            result = subprocess.run([ffmpeg_command() or 'ffmpeg', '-y', '-i', temp_file, '-c', 'copy', output_path],
-                                   capture_output=True, timeout=30,
-                                   creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-        except subprocess.TimeoutExpired:
-            print(f"FFmpeg封装超时（30s），跳过此文件。")
-            return False
-        if result.returncode != 0:
-            stderr_decoded = result.stderr.decode('utf-8', errors='ignore')
-            stdout_decoded = result.stdout.decode('utf-8', errors='ignore')
-            print(f"FFmpeg封装失败: {stderr_decoded}")
-            print(f"FFmpeg stdout: {stdout_decoded}")
-            return False
-
-        # 删除临时文件
-        if temp_file.exists():
-            temp_file.unlink()
-            print(f"临时文件已删除: {temp_file}")
-
-        return True
-
-    except Exception as e:
-        print(f"音频下载失败: {e}")
-        import traceback
-        traceback.print_exc()
+    except (OSError, ValueError, requests.RequestException) as error:
+        detail = type(error).__name__ if isinstance(error, (OSError, requests.RequestException)) else str(error)
+        print(f"音频下载失败: {detail}")
         return False
 
 
@@ -302,21 +368,8 @@ def download_selected_audio(task_info, selected_index, output_dir=AUDIO_DIR):
     print(f"[程序执行阶段] AI已选择序号 {selected_index}: 《{video_title[:50]}...》")
     print(f"  开始下载音频...")
 
-    # 调用原有的下载函数
-    stop_event = threading.Event()
-    dot_thread = threading.Thread(target=print_dots, args=(stop_event,))
-    dot_thread.daemon = True
-    dot_thread.start()
-
-    download_url = selected_video['link']
-    if download_url.startswith('/'):
-        download_url = 'https://www.bilibili.com' + download_url
-
-    try:
-        success = download_audio(keyword, download_url, output_dir)
-    finally:
-        stop_event.set()
-        dot_thread.join(timeout=1)
+    download_url = urljoin("https://www.bilibili.com/", selected_video["link"])
+    success = download_audio(keyword, download_url, output_dir)
 
     if success:
         msg = f"「{keyword}」音频下载完成！(基于AI选择：{selected_index})"

@@ -1,10 +1,9 @@
 import argparse
 from pathlib import Path
 import time
-import traceback
 
 import bilibili_audio_module_ai as audio_module
-from ai_selector import ask_ai_to_choose
+from ai_selector import ask_ai_to_choose_batch
 from local_config import APP_DIR, get_config
 
 
@@ -54,65 +53,65 @@ def main():
 
 
 def run_keywords(all_keywords, api_key, output_dir=audio_module.AUDIO_DIR):
-    print(f"[OK] 找到 {len(all_keywords)} 个待处理关键词，开始自动化AI协作流程...\n")
-
-    # 统计信息
-    success_count = 0
-    fail_count = 0
-    failed_keywords = []  # 记录失败的关键词
-
-    # 2. 逐条处理关键词
-    for i, keyword in enumerate(all_keywords, 1):
-        print(f"\n{'=' * 60}")
-        print(f"处理进度: ({i}/{len(all_keywords)})")
-        print(f"当前关键词: 「{keyword}」")
-        print(f"{'=' * 60}")
-
+    total = len(all_keywords)
+    tasks = {}
+    search_errors = {}
+    print(f"[1/3] 搜索 {total} 个关键词")
+    for task_id, keyword in enumerate(all_keywords, 1):
+        print(f"\n[{task_id}/{total}] {keyword}")
         try:
-            # 2.1 阶段一：程序搜索，获取结果
-            task_info = audio_module.search_and_list_videos(keyword)
-            if not task_info['videos']:
-                print(f"  跳过，未找到视频。\n")
-                fail_count += 1
-                failed_keywords.append(keyword)
-                # 写入日志（失败：无视频）
-                with LOG_FILE.open('a', encoding='utf-8') as log:
-                    log.write(f"成功: False | {time.ctime()} | 关键词: {keyword} | AI选择: 无 | 原因: 未找到视频\n")
-                continue
-
-            # 2.2 阶段二：AI分析并选择序号
-            print(f"  正在请求AI分析并选择最佳视频...")
-            ai_choice = ask_ai_to_choose(task_info['videos'], keyword, api_key)
-            print(f"  [OK] AI最终决策：选择序号 [{ai_choice}]")
-
-            # 2.3 阶段三：程序根据AI选择执行下载
-            final_result = audio_module.download_selected_audio(task_info, ai_choice, output_dir)
-
-            if final_result.get('success'):
-                success_count += 1
-                # 写入日志（成功）
-                with LOG_FILE.open('a', encoding='utf-8') as log:
-                    log.write(f"成功: True | {time.ctime()} | 关键词: {keyword} | AI选择: {ai_choice}\n")
+            task = audio_module.search_and_list_videos(keyword)
+            if task["videos"]:
+                tasks[task_id] = task
             else:
-                fail_count += 1
+                search_errors[task_id] = "未匹配到视频"
+        except audio_module.SearchError as error:
+            search_errors[task_id] = str(error)
+        except Exception as error:
+            search_errors[task_id] = f"搜索异常 ({type(error).__name__})"
+        if task_id in search_errors:
+            print(f"  [!] {search_errors[task_id]}")
+        if task_id < total:
+            time.sleep(2)
+
+    choices = {}
+    if tasks:
+        print(f"\n[2/3] 一次提交 {len(tasks)} 首的候选给 DeepSeek")
+        choices = ask_ai_to_choose_batch(tasks, api_key)
+        print("\n[3/3] 按关键词顺序下载")
+    else:
+        print("\n没有可用候选，跳过 AI 选源和下载。")
+
+    success_count = 0
+    failed_keywords = []
+    with LOG_FILE.open("a", encoding="utf-8", buffering=1) as log:
+        for task_id, keyword in enumerate(all_keywords, 1):
+            success = False
+            ai_choice = choices.get(task_id)
+            reason = search_errors.get(task_id, "")
+            if task_id in tasks:
+                print(f"\n[{task_id}/{total}] {keyword}")
+                try:
+                    success = audio_module.download_selected_audio(
+                        tasks[task_id], ai_choice or 1, output_dir
+                    )["success"]
+                    if not success:
+                        reason = "下载或封装失败"
+                except Exception as error:
+                    reason = f"下载异常 ({type(error).__name__})"
+                if reason:
+                    print(f"  [!] {reason}")
+
+            if success:
+                success_count += 1
+            else:
                 failed_keywords.append(keyword)
-                # 写入日志（下载失败）
-                with LOG_FILE.open('a', encoding='utf-8') as log:
-                    log.write(f"成功: False | {time.ctime()} | 关键词: {keyword} | AI选择: {ai_choice} | 原因: 下载失败\n")
+            choice_label = ai_choice if ai_choice is not None else "-"
+            fallback = " | 回退候选: 1" if task_id in tasks and ai_choice is None else ""
+            entry = f"成功: {success} | {time.ctime()} | 关键词: {keyword} | AI选择: {choice_label}{fallback}"
+            log.write(f"{entry} | 原因: {reason}\n" if reason else entry + "\n")
 
-        except Exception as e:
-            print(f"  处理关键词「{keyword}」时发生未预期的错误: {e}")
-            traceback.print_exc()
-            fail_count += 1
-            failed_keywords.append(keyword)
-            # 写入日志（异常）
-            with LOG_FILE.open('a', encoding='utf-8') as log:
-                log.write(f"成功: False | {time.ctime()} | 关键词: {keyword} | AI选择: 无 | 原因: 异常: {str(e)}\n")
-
-        # 2.4 短暂间隔
-        time.sleep(2)
-        print(f"  当前关键词处理完毕。\n")
-
+    fail_count = len(failed_keywords)
     # 最终总结
     print(f"\n[Done] 处理完成！总计 {len(all_keywords)} 个关键词，成功 {success_count} 个，失败 {fail_count} 个。")
     if failed_keywords:

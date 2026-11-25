@@ -4,11 +4,14 @@ __pycache__/
 *.py[cod]
 /ai_download_log.txt
 /B站下载的音频/
+/下载的音频/
 
 /build/
 /dist/
 /ffmpeg.exe
 
 /*.m4a
+/*.flac
+/*.mka
 /*_temp.m4s
-/.music-crawler-*
+.music-crawler-*

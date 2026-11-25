@@ -1,26 +1,31 @@
 from contextlib import redirect_stderr, redirect_stdout
+import ctypes
 import os
 from pathlib import Path
 from queue import Empty, SimpleQueue
 from threading import Thread
 from time import monotonic
 import tkinter as tk
-from tkinter import messagebox, ttk
+import webbrowser
+from tkinter import filedialog, messagebox, ttk
 
 from bilibili_audio_module_ai import ffmpeg_command
 from local_config import APP_DIR, get_config, read_local_config, save_credentials, write_local_text
 from main_controller_ai_choice import KEYWORD_FILE, run_keywords
 
 
-BACKGROUND = "#F1F5FA"
-WHITE = "#FFFFFF"
-INK = "#132641"
-MUTED = "#50627A"
-BORDER = "#DCE5EF"
-NAV = "#0D2039"
-NAV_ACTIVE = "#233C59"
-ACCENT = "#006B61"
-FONT = "Segoe UI"
+BACKGROUND = "#111722"
+SIDEBAR = "#0B101A"
+WHITE = "#182231"
+INK = "#ECF2FA"
+MUTED = "#A9B8CA"
+BORDER = "#2A394B"
+LOG_BACKGROUND = "#0E1722"
+SELECTED = "#203747"
+EDITOR_BACKGROUND = "#111B28"
+ACCENT = "#80EDC7"
+FONT = "Microsoft YaHei UI"
+DEFAULT_OUTPUT_DIR = APP_DIR / "下载的音频"
 
 
 class TaskOutput:
@@ -57,12 +62,22 @@ class MusicCrawlerWindow:
         self.root = root
         self.events = SimpleQueue()
         self.running = False
+        self.output_dir = DEFAULT_OUTPUT_DIR
         self.status = tk.StringVar(value="就绪")
         self.progress = tk.StringVar(value="")
         root.title("AI Music Crawler")
-        root.geometry("1030x720")
-        root.minsize(880, 660)
+        scale = float(root.tk.call("tk", "scaling")) * 72 / 96
+        screen_width, screen_height = root.winfo_screenwidth(), root.winfo_screenheight()
+        width = min(round(1080 * scale), round(screen_width * 0.92))
+        height = min(round(760 * scale), round(screen_height * 0.87))
+        root.geometry(f"{width}x{height}+{(screen_width - width) // 2}+{(screen_height - height) // 2}")
+        root.minsize(min(width, round(690 * scale)), min(height, round(510 * scale)))
         root.configure(bg=BACKGROUND)
+        root.update_idletasks()
+        if os.name == "nt":
+            hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+            dark = ctypes.c_int(1)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(dark), ctypes.sizeof(dark))
         icon_dir = Path(__file__).resolve().parent
         icon = icon_dir / "assets" / "app.ico"
         if icon.is_file():
@@ -72,38 +87,51 @@ class MusicCrawlerWindow:
         style = ttk.Style(root)
         style.theme_use("clam")
         style.configure("Action.TButton", font=(FONT, 10, "bold"), padding=(17, 9),
-                        background=ACCENT, foreground=WHITE, borderwidth=0)
-        style.map("Action.TButton", background=[("disabled", "#91AAA7"), ("active", "#00574F")])
+                        background=ACCENT, foreground="#102B25", borderwidth=0)
+        style.map("Action.TButton", background=[("disabled", "#384C51"), ("active", "#A5F5DA")],
+                  foreground=[("disabled", "#B7C7CD")])
         style.configure("Outline.TButton", font=(FONT, 10), padding=(13, 7),
-                        background="#E8EFF7", foreground=INK, borderwidth=0)
-        style.map("Outline.TButton", background=[("active", "#D4E3F1")])
-        style.configure("Settings.TEntry", padding=9, foreground=INK, fieldbackground=WHITE)
+                        background="#26374A", foreground=INK, borderwidth=0)
+        style.map("Outline.TButton", background=[("active", "#31485E")])
+        style.configure("Settings.TEntry", padding=10, foreground=INK, fieldbackground=EDITOR_BACKGROUND,
+                        bordercolor=BORDER, lightcolor=EDITOR_BACKGROUND, darkcolor=EDITOR_BACKGROUND)
+        style.map("Settings.TEntry", bordercolor=[("focus", ACCENT)],
+                  fieldbackground=[("readonly", EDITOR_BACKGROUND)])
+        style.configure("App.Vertical.TScrollbar", background="#40576B", troughcolor=EDITOR_BACKGROUND,
+                        bordercolor=EDITOR_BACKGROUND, lightcolor="#40576B", darkcolor="#40576B", arrowsize=10)
+        style.map("App.Vertical.TScrollbar", background=[("active", "#5C7890")])
         style.configure("Settings.TCheckbutton", background=WHITE, foreground=INK, font=(FONT, 10))
+        style.map("Settings.TCheckbutton", background=[("active", WHITE)], foreground=[("active", ACCENT)])
 
-        sidebar = tk.Frame(root, bg=NAV, width=210)
+        sidebar = tk.Frame(root, bg=SIDEBAR, width=round(174 * scale))
         sidebar.pack(side="left", fill="y")
         sidebar.pack_propagate(False)
-        label(sidebar, "AI Music", size=21, color=WHITE, background=NAV, bold=True).pack(
-            fill="x", padx=22, pady=(32, 0)
-        )
-        label(sidebar, "Crawler", size=21, color="#61E6CB", background=NAV, bold=True).pack(
-            fill="x", padx=22, pady=(0, 31)
-        )
+        brand = tk.Frame(sidebar, bg=SIDEBAR)
+        brand.pack(fill="x", padx=15, pady=(24, 28))
+        if icon.is_file():
+            try:
+                self.brand_icon = tk.PhotoImage(file=str(icon.with_name("app.png"))).subsample(7, 7)
+                tk.Label(brand, image=self.brand_icon, bg=SIDEBAR, borderwidth=0).pack(side="left", padx=(0, 8))
+            except tk.TclError:
+                pass
+        label(brand, "AI Music\nCrawler", size=11, background=SIDEBAR, bold=True).pack(side="left")
+
         self.nav = {}
         for name, title in (("tasks", "下载任务"), ("settings", "设置")):
             button = tk.Button(
                 sidebar, text=title, command=lambda page=name: self.show(page), anchor="w",
-                bg=NAV, fg=WHITE, activebackground=NAV_ACTIVE, activeforeground=WHITE,
-                font=(FONT, 11, "bold"), relief="flat", bd=0, padx=15, pady=11, cursor="hand2",
+                bg=SIDEBAR, fg=MUTED, activebackground=SELECTED, activeforeground=ACCENT,
+                font=(FONT, 10, "bold"), relief="flat", bd=0, padx=14, pady=11, cursor="hand2",
             )
-            button.pack(fill="x", padx=12, pady=3)
+            button.pack(fill="x", padx=11, pady=(0, 5))
             self.nav[name] = button
-        label(sidebar, "Windows 桌面版", color="#B5C8DD", background=NAV).pack(
-            side="bottom", fill="x", padx=22, pady=23
+
+        ttk.Button(sidebar, text="打开保存目录", style="Outline.TButton", command=self.open_output).pack(
+            side="bottom", fill="x", padx=12, pady=18
         )
 
         workspace = tk.Frame(root, bg=BACKGROUND)
-        workspace.pack(side="left", fill="both", expand=True, padx=25, pady=21)
+        workspace.pack(side="left", fill="both", expand=True, padx=round(20 * scale), pady=round(18 * scale))
         workspace.grid_rowconfigure(0, weight=1)
         workspace.grid_columnconfigure(0, weight=1)
         self.pages = {
@@ -119,18 +147,19 @@ class MusicCrawlerWindow:
     def show(self, page):
         self.pages[page].tkraise()
         for name, button in self.nav.items():
-            button.configure(bg=NAV_ACTIVE if name == page else NAV)
+            button.configure(bg=SELECTED if name == page else SIDEBAR, fg=ACCENT if name == page else MUTED)
 
     def card(self, parent):
         return tk.Frame(parent, bg=WHITE, highlightbackground=BORDER, highlightthickness=1)
 
     def text_box(self, parent, *, height, bg, fg):
-        frame = tk.Frame(parent, bg=bg)
-        scrollbar = ttk.Scrollbar(frame, orient="vertical")
+        frame = tk.Frame(parent, bg=bg, highlightbackground=BORDER, highlightthickness=1)
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", style="App.Vertical.TScrollbar")
         box = tk.Text(
             frame, height=height, bg=bg, fg=fg, insertbackground=fg, wrap="word",
             yscrollcommand=scrollbar.set, relief="flat", padx=11, pady=8,
-            font=(FONT, 11), undo=bg == BACKGROUND, highlightthickness=0,
+            font=(FONT, 11), undo=bg == EDITOR_BACKGROUND, highlightthickness=0,
+            spacing1=2, spacing3=3, selectbackground="#34586D", selectforeground=INK,
         )
         scrollbar.configure(command=box.yview)
         scrollbar.pack(side="right", fill="y")
@@ -139,36 +168,37 @@ class MusicCrawlerWindow:
 
     def make_tasks(self, workspace):
         page = tk.Frame(workspace, bg=BACKGROUND)
-        label(page, "下载任务", size=23, background=BACKGROUND, bold=True).pack(fill="x")
-        label(page, "输入歌曲名或搜索词，每行一条。", color=MUTED, background=BACKGROUND).pack(
-            fill="x", pady=(2, 13)
-        )
+        heading = tk.Frame(page, bg=BACKGROUND)
+        heading.pack(fill="x", pady=(1, 16))
+        label(heading, "下载任务", size=20, background=BACKGROUND, bold=True).pack(side="left")
+        tk.Label(heading, textvariable=self.status, bg=SELECTED, fg=ACCENT,
+                 font=(FONT, 10, "bold"), padx=12, pady=5).pack(side="right")
 
-        keywords = self.card(page)
-        keywords.pack(fill="x", pady=(0, 12))
-        label(keywords, "关键词", size=12, bold=True).pack(fill="x", padx=15, pady=(9, 2))
-        editor, self.editor = self.text_box(keywords, height=5, bg=BACKGROUND, fg=INK)
-        editor.pack(fill="x", padx=15, pady=(3, 8))
-        controls = tk.Frame(keywords, bg=WHITE)
-        controls.pack(fill="x", padx=15, pady=(0, 11))
-        self.start_button = ttk.Button(controls, text="开始下载", style="Action.TButton", command=self.start)
-        self.start_button.pack(side="left")
-        self.save_button = ttk.Button(controls, text="保存关键词", style="Outline.TButton", command=self.save_keywords)
-        self.save_button.pack(side="left", padx=7)
-        ttk.Button(controls, text="打开保存目录", style="Outline.TButton", command=self.open_output).pack(side="right")
+        panels = tk.Frame(page, bg=BACKGROUND)
+        panels.pack(fill="both", expand=True)
+        panels.grid_rowconfigure(0, weight=1)
+        panels.grid_columnconfigure(0, weight=2, uniform="task")
+        panels.grid_columnconfigure(1, weight=3, uniform="task")
 
-        logs = self.card(page)
-        logs.pack(fill="both", expand=True)
-        toolbar = tk.Frame(logs, bg=WHITE)
-        toolbar.pack(fill="x", padx=15, pady=(8, 3))
-        label(toolbar, "运行日志", size=12, bold=True).pack(side="left")
-        tk.Label(toolbar, textvariable=self.status, bg="#E5F4F1", fg=ACCENT,
-                 font=(FONT, 10, "bold"), padx=9, pady=3).pack(side="right")
-        output, self.log = self.text_box(logs, height=6, bg=NAV, fg="#E2EDF8")
-        output.pack(fill="both", expand=True, padx=15, pady=(5, 5))
-        self.log.configure(state="disabled")
+        keywords = self.card(panels)
+        keywords.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        label(keywords, "关键词", size=13, bold=True).pack(fill="x", padx=14, pady=(13, 2))
+        label(keywords, "每行一个歌名或搜索词", color=MUTED).pack(fill="x", padx=14, pady=(0, 10))
+        editor, self.editor = self.text_box(keywords, height=5, bg=EDITOR_BACKGROUND, fg=INK)
+        editor.pack(fill="both", expand=True, padx=14, pady=(0, 12))
+        self.start_button = ttk.Button(keywords, text="开始下载", style="Action.TButton", command=self.start)
+        self.start_button.pack(fill="x", padx=14, pady=(0, 7))
+        self.save_button = ttk.Button(keywords, text="保存关键词", style="Outline.TButton", command=self.save_keywords)
+        self.save_button.pack(fill="x", padx=14, pady=(0, 14))
+
+        logs = self.card(panels)
+        logs.grid(row=0, column=1, sticky="nsew")
+        label(logs, "运行日志", size=13, bold=True).pack(fill="x", padx=14, pady=(13, 2))
         tk.Label(logs, textvariable=self.progress, anchor="w", bg=WHITE, fg=MUTED,
-                 font=(FONT, 10)).pack(fill="x", padx=15, pady=(0, 6))
+                 font=(FONT, 9)).pack(fill="x", padx=14, pady=(0, 10))
+        output, self.log = self.text_box(logs, height=5, bg=LOG_BACKGROUND, fg="#D9E7F7")
+        output.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+        self.log.configure(state="disabled")
         return page
 
     def make_settings(self, workspace):
@@ -194,12 +224,26 @@ class MusicCrawlerWindow:
             field.pack(fill="x", pady=(0, 16))
             self.fields.append(field)
 
+        label(body, "下载位置", size=12, bold=True).pack(fill="x", pady=(0, 6))
+        folder_row = tk.Frame(body, bg=WHITE)
+        folder_row.pack(fill="x", pady=(0, 16))
+        self.folder_selection = tk.StringVar(value=str(self.output_dir))
+        ttk.Entry(folder_row, textvariable=self.folder_selection, style="Settings.TEntry",
+                  state="readonly", font=(FONT, 10)).pack(side="left", fill="x", expand=True)
+        ttk.Button(folder_row, text="选择文件夹", style="Outline.TButton",
+                   command=self.choose_output).pack(side="left", padx=(8, 0))
+        ttk.Button(folder_row, text="恢复默认", style="Outline.TButton",
+                   command=lambda: self.folder_selection.set(str(DEFAULT_OUTPUT_DIR))).pack(side="left", padx=(8, 0))
+
         buttons = tk.Frame(body, bg=WHITE)
         buttons.pack(fill="x")
         self.save_settings_button = ttk.Button(
             buttons, text="保存设置", style="Action.TButton", command=self.save_settings
         )
         self.save_settings_button.pack(side="left")
+        ttk.Button(
+            buttons, text="打开 B 站", style="Outline.TButton", command=self.open_bilibili
+        ).pack(side="left", padx=(8, 0))
         ttk.Checkbutton(buttons, text="显示凭据", variable=self.visible, command=self.toggle_visibility,
                         style="Settings.TCheckbutton").pack(side="left", padx=13)
         self.settings_status = tk.StringVar()
@@ -213,24 +257,52 @@ class MusicCrawlerWindow:
             if KEYWORD_FILE.is_file():
                 self.editor.insert("1.0", KEYWORD_FILE.read_text(encoding="utf-8-sig"))
             config = read_local_config()
+            if configured_dir := config.get("DOWNLOAD_DIR"):
+                self.output_dir = APP_DIR / configured_dir
+            self.folder_selection.set(str(self.output_dir))
             self.api_key.set(config.get("DEEPSEEK_API_KEY", ""))
             self.cookie.set(config.get("BILIBILI_COOKIE", ""))
         except (OSError, UnicodeError):
             self.append_log("无法读取本地配置或关键词文件，请检查文件权限和 UTF-8 编码。\n")
 
+    def open_bilibili(self):
+        url = "https://www.bilibili.com/"
+        try:
+            opened = webbrowser.open_new_tab(url)
+        except (OSError, webbrowser.Error):
+            opened = False
+        if opened:
+            self.settings_status.set("已请求打开 B 站。如需配置 Cookie，请手动填写并保存。")
+        else:
+            messagebox.showinfo("打开 B 站", f"请在浏览器打开 {url}", parent=self.root)
+
     def toggle_visibility(self):
         for field in self.fields:
             field.configure(show="" if self.visible.get() else "*")
 
+    def choose_output(self):
+        current = Path(self.folder_selection.get())
+        selected = filedialog.askdirectory(
+            parent=self.root, title="选择下载文件夹",
+            initialdir=str(current if current.is_dir() else APP_DIR),
+        )
+        if selected:
+            self.folder_selection.set(str(Path(selected)))
+
     def save_settings(self):
+        selected = Path(self.folder_selection.get())
         try:
-            save_credentials(self.api_key.get(), self.cookie.get())
+            save_credentials(
+                self.api_key.get(), self.cookie.get(),
+                download_dir="" if selected == DEFAULT_OUTPUT_DIR else str(selected),
+            )
         except ValueError:
             messagebox.showerror("设置未保存", "每项凭据必须是单行文本。", parent=self.root)
             return
         except (OSError, UnicodeError):
             messagebox.showerror("设置未保存", "无法写入配置。请检查程序所在目录的读写权限。", parent=self.root)
             return
+        self.output_dir = selected
         self.settings_status.set("已保存到本机。")
         self.visible.set(False)
         self.toggle_visibility()
@@ -248,9 +320,10 @@ class MusicCrawlerWindow:
 
     def open_output(self):
         try:
-            os.startfile(APP_DIR)
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            os.startfile(self.output_dir)
         except OSError:
-            messagebox.showerror("无法打开目录", str(APP_DIR), parent=self.root)
+            messagebox.showerror("无法打开目录", str(self.output_dir), parent=self.root)
 
     def start(self):
         if self.running:
@@ -275,19 +348,28 @@ class MusicCrawlerWindow:
             messagebox.showinfo("缺少 FFmpeg", "请将 ffmpeg.exe 放在程序旁边，或将 FFmpeg 加入 PATH。", parent=self.root)
             return
 
+        output_dir = self.output_dir
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            messagebox.showerror(
+                "无法创建下载目录", str(output_dir), parent=self.root
+            )
+            return
+
         self.set_running(True)
         self.log.configure(state="normal")
         self.log.delete("1.0", "end")
         self.log.configure(state="disabled")
-        self.append_log(f"保存目录：{APP_DIR}\n")
-        Thread(target=self.run_task, args=(keywords, api_key, cookie), daemon=True).start()
+        self.append_log(f"保存目录：{output_dir}\n")
+        Thread(target=self.run_task, args=(keywords, api_key, cookie, output_dir), daemon=True).start()
 
-    def run_task(self, keywords, api_key, cookie):
+    def run_task(self, keywords, api_key, cookie, output_dir):
         cookie_values = [part.partition("=")[2].strip() for part in cookie.split(";")]
         stream = TaskOutput(self.events, (api_key, cookie, *(v for v in cookie_values if len(v) >= 8)))
         try:
             with redirect_stdout(stream), redirect_stderr(stream):
-                result = run_keywords(keywords, api_key, APP_DIR)
+                result = run_keywords(keywords, api_key, output_dir)
             self.events.put(("complete", result))
         except Exception as error:
             self.events.put(("error", f"任务异常结束（{type(error).__name__}）。"))
@@ -347,6 +429,8 @@ class MusicCrawlerWindow:
 
 
 def main():
+    if os.name == "nt":
+        ctypes.windll.user32.SetProcessDPIAware()
     root = tk.Tk()
     MusicCrawlerWindow(root)
     root.mainloop()

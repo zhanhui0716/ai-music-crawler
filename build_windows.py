@@ -61,6 +61,7 @@ def main():
             "--workpath", str(build / "work"),
             "--specpath", str(build),
             "--add-data", f"{ROOT / 'assets' / 'app.ico'}:assets",
+            "--add-data", f"{ROOT / 'assets' / 'app.png'}:assets",
             str(ROOT / "desktop_app.pyw"),
         ], cwd=ROOT, check=True)
 
