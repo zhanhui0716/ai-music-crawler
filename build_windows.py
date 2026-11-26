@@ -44,9 +44,7 @@ def main():
         raise SystemExit("Build this release using 64-bit Python on Windows.")
 
     template = ROOT / "secrets.example.txt"
-    if template.read_text(encoding="utf-8-sig").splitlines() != [
-        "DEEPSEEK_API_KEY=", "BILIBILI_COOKIE="
-    ]:
+    if template.read_text(encoding="utf-8-sig").splitlines() != ["BILIBILI_COOKIE="]:
         raise SystemExit("The release requires an empty secrets.example.txt template.")
 
     DIST.mkdir(exist_ok=True)

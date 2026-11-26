@@ -6,6 +6,8 @@ from tempfile import NamedTemporaryFile
 
 APP_DIR = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 SECRETS_FILE = APP_DIR / "secrets.txt"
+DEFAULT_PARALLEL_JOBS = 3
+MAX_PARALLEL_JOBS = 10
 
 
 def read_local_config():
@@ -22,6 +24,13 @@ def read_local_config():
         if separator and key.strip():
             config.setdefault(key.strip(), value.strip())
     return config
+
+
+def parse_parallel_jobs(value):
+    try:
+        return max(1, min(MAX_PARALLEL_JOBS, int(value)))
+    except (TypeError, ValueError):
+        return DEFAULT_PARALLEL_JOBS
 
 
 def get_config(name):
@@ -42,12 +51,14 @@ def write_local_text(path, contents):
             temp_path.unlink(missing_ok=True)
 
 
-def save_credentials(api_key, cookie, *, download_dir=None):
-    values = (api_key.strip(), cookie.strip())
-    if any("\r" in value or "\n" in value for value in values):
+def save_credentials(cookie, *, download_dir=None, parallel_jobs=None):
+    cookie = cookie.strip()
+    if "\r" in cookie or "\n" in cookie:
         raise ValueError("Each credential must be on one line.")
     config = read_local_config()
-    config.update(zip(("DEEPSEEK_API_KEY", "BILIBILI_COOKIE"), values))
+    config["BILIBILI_COOKIE"] = cookie
     if download_dir is not None:
         config["DOWNLOAD_DIR"] = download_dir
+    if parallel_jobs is not None:
+        config["PARALLEL_JOBS"] = str(parse_parallel_jobs(parallel_jobs))
     write_local_text(SECRETS_FILE, "".join(f"{key}={value}\n" for key, value in config.items()))

@@ -31,7 +31,7 @@ def sanitize_filename(name):
 
 
 # 带重试的流式下载
-def download_large_file(url, filepath, headers, max_retry=3):
+def download_large_file(url, filepath, headers, max_retry=3, *, progress_label=""):
     for attempt in range(max_retry):
         try:
             with requests.get(url, headers=headers, stream=True, timeout=(10, 30)) as r:
@@ -49,7 +49,7 @@ def download_large_file(url, filepath, headers, max_retry=3):
                             if total_size > 0 and (now - last_update >= 0.25 or downloaded == total_size):
                                 last_update = now
                                 percent = downloaded / total_size * 100
-                                print(f"\r下载中: {percent:.1f}%", end='', flush=True)
+                                print(f"\r{progress_label} 下载中: {percent:.1f}%", end='', flush=True)
                 print()
                 if not downloaded:
                     raise requests.RequestException("Empty media response")
@@ -239,7 +239,7 @@ def save_audio_stream(stream, ffmpeg, headers, work_dir, output_dir, filename, v
     }
     if audio_cache_matches(output_path, receipt_path, source):
         print(f"已存在，跳过下载：{output_path.name}（{description}）")
-        return True
+        return "skipped"
     print(f"正在尝试音轨：{description}")
 
     temp_file = work_dir / "download.m4s"
@@ -247,7 +247,7 @@ def save_audio_stream(stream, ffmpeg, headers, work_dir, output_dir, filename, v
     for index, media_url in enumerate([stream["url"], *stream["backup_urls"]]):
         if index:
             print("尝试备用下载地址。")
-        if not download_large_file(media_url, temp_file, headers):
+        if not download_large_file(media_url, temp_file, headers, progress_label=filename):
             continue
         try:
             result = subprocess.run(
@@ -273,8 +273,8 @@ def save_audio_stream(stream, ffmpeg, headers, work_dir, output_dir, filename, v
         except OSError:
             print("音频已保存，但无法写入下载记录。")
         print(f"已保存：{output_path.name}（{description}）")
-        return True
-    return False
+        return "downloaded"
+    return None
 
 
 def download_audio(keyword, url, output_dir=AUDIO_DIR):
@@ -308,23 +308,24 @@ def download_audio(keyword, url, output_dir=AUDIO_DIR):
         filename = sanitize_filename(keyword)
         with TemporaryDirectory(prefix=".music-crawler-", dir=output_dir) as work_dir:
             for stream in streams:
-                if save_audio_stream(stream, ffmpeg, headers, Path(work_dir), output_dir, filename, video):
-                    return True
+                outcome = save_audio_stream(stream, ffmpeg, headers, Path(work_dir), output_dir, filename, video)
+                if outcome:
+                    return outcome
         print("所有可用音轨均下载或封装失败。")
-        return False
+        return None
 
     except (OSError, ValueError, requests.RequestException) as error:
         detail = type(error).__name__ if isinstance(error, (OSError, requests.RequestException)) else str(error)
         print(f"音频下载失败: {detail}")
-        return False
+        return None
 
 
 def search_and_list_videos(keyword):
     """
     阶段一：搜索并列出视频。
-    返回一个字典，包含关键词和详细的视频结果列表，用于展示给AI。
+    返回一个字典，包含关键词和详细的视频结果列表，用于展示给本地规则。
     """
-    print(f"[AI决策阶段] 正在为关键词「{keyword}」搜索视频...")
+    print(f"[本地规则决策阶段] 正在为关键词「{keyword}」搜索视频...")
     videos = search_bilibili_videos(keyword)  # 调用原有的搜索函数
     if not videos:
         print(f"  警告：未找到关键词「{keyword}」的相关视频。")
@@ -341,15 +342,15 @@ def search_and_list_videos(keyword):
             'date': v['date'],
             'link': v['link']
         })
-    print(f"  成功找到 {len(formatted_results)} 个结果，已准备发送给AI进行选择。")
+    print(f"  成功找到 {len(formatted_results)} 个结果，将按本地规则排序。")
     return {'keyword': keyword, 'videos': formatted_results}
 
 
 def download_selected_audio(task_info, selected_index, output_dir=AUDIO_DIR):
     """
-    阶段二：根据AI选择的序号下载音频。
+    阶段二：根据本地规则选择的序号下载音频。
     :param task_info: 来自 search_and_list_videos 的返回字典
-    :param selected_index: AI选择的序号（1-10之间的整数）
+    :param selected_index: 本地规则选择的序号（1-10之间的整数）
     :return: 下载结果字典
     """
     keyword = task_info['keyword']
@@ -359,23 +360,18 @@ def download_selected_audio(task_info, selected_index, output_dir=AUDIO_DIR):
         return {'success': False, 'message': f'无可用视频，跳过下载。'}
 
     if not (1 <= selected_index <= len(videos)):
-        print(f"  AI选择的序号 {selected_index} 无效，将自动选择第一个。")
+        print(f"  本地规则选择的序号 {selected_index} 无效，将自动选择第一个。")
         selected_index = 1
 
     selected_video = videos[selected_index - 1]  # 调整为列表索引
     video_title = selected_video['title']
 
-    print(f"[程序执行阶段] AI已选择序号 {selected_index}: 《{video_title[:50]}...》")
-    print(f"  开始下载音频...")
-
+    print(f"[程序执行阶段] 本地规则已选择序号 {selected_index}: 《{video_title[:50]}...》")
     download_url = urljoin("https://www.bilibili.com/", selected_video["link"])
-    success = download_audio(keyword, download_url, output_dir)
-
-    if success:
-        msg = f"「{keyword}」音频下载完成！(基于AI选择：{selected_index})"
-        print(f"  [OK] {msg}")
-        return {'success': True, 'keyword': keyword, 'ai_choice': selected_index, 'message': msg}
-    else:
-        msg = f"「{keyword}」音频下载失败。"
-        print(f"  [!] {msg}")
-        return {'success': False, 'keyword': keyword, 'ai_choice': selected_index, 'message': msg}
+    outcome = download_audio(keyword, download_url, output_dir)
+    return {
+        "success": outcome is not None,
+        "skipped": outcome == "skipped",
+        "keyword": keyword,
+        "ai_choice": selected_index,
+    }

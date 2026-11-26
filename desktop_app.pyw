@@ -1,17 +1,21 @@
 from contextlib import redirect_stderr, redirect_stdout
 import ctypes
+from datetime import datetime
 import os
 from pathlib import Path
 from queue import Empty, SimpleQueue
-from threading import Thread
+from threading import Lock, Thread, get_ident
 from time import monotonic
 import tkinter as tk
 import webbrowser
 from tkinter import filedialog, messagebox, ttk
 
 from bilibili_audio_module_ai import ffmpeg_command
-from local_config import APP_DIR, get_config, read_local_config, save_credentials, write_local_text
-from main_controller_ai_choice import KEYWORD_FILE, run_keywords
+from local_config import (
+    APP_DIR, DEFAULT_PARALLEL_JOBS, MAX_PARALLEL_JOBS, get_config, parse_parallel_jobs,
+    read_local_config, save_credentials, write_local_text,
+)
+from main_controller_ai_choice import KEYWORD_FILE, LOG_FILE, LOG_KEYWORD, run_keywords
 
 
 BACKGROUND = "#111722"
@@ -33,18 +37,32 @@ class TaskOutput:
         self.events = events
         self.secrets = tuple(value for value in secrets if value)
         self.last_progress = 0
+        self.parts = {}
+        self.lock = Lock()
 
     def write(self, text):
-        for secret in self.secrets:
-            text = text.replace(secret, "[已隐藏]")
-        if text.startswith("\r"):
-            now = monotonic()
-            if now - self.last_progress >= 0.35:
-                self.events.put(("progress", text.strip()))
-                self.last_progress = now
-        elif text and text != ".":
-            self.events.put(("log", text))
-        return len(text)
+        size = len(text)
+        keyword = LOG_KEYWORD.get()
+        with self.lock:
+            if text.startswith("\r"):
+                now = monotonic()
+                if now - self.last_progress >= 0.35:
+                    self.events.put(("progress", text.strip()))
+                    self.last_progress = now
+                return size
+            thread = get_ident()
+            lines = (self.parts.pop(thread, "") + text).split("\n")
+            if lines[-1]:
+                self.parts[thread] = lines[-1]
+            prefix = f"{datetime.now():%H:%M:%S}  " + (f"「{keyword}」 " if keyword else "")
+            for line in lines[:-1]:
+                if not line.strip() or line == ".":
+                    continue
+                message = prefix + line.strip()
+                for secret in self.secrets:
+                    message = message.replace(secret, "[已隐藏]")
+                self.events.put(("log", message + "\n"))
+        return size
 
     def flush(self):
         pass
@@ -57,12 +75,72 @@ def label(parent, text, *, size=10, color=INK, background=WHITE, bold=False):
     )
 
 
+class ParallelSlider(tk.Canvas):
+    def __init__(self, parent, variable):
+        scaling = float(parent.tk.call("tk", "scaling")) * 72 / 96
+        self.radius = max(8, round(8 * scaling))
+        super().__init__(parent, height=self.radius * 3, bg=WHITE, highlightthickness=0,
+                         takefocus=True, cursor="hand2")
+        self.variable = variable
+        self.drag_value = None
+        self.variable.trace_add("write", self.redraw)
+        for event in ("<Configure>", "<FocusIn>", "<FocusOut>"):
+            self.bind(event, self.redraw)
+        self.bind("<Button-1>", self.drag)
+        self.bind("<B1-Motion>", self.drag)
+        self.bind("<ButtonRelease-1>", self.release)
+        for key, step in (("Left", -1), ("Down", -1), ("Right", 1), ("Up", 1),
+                          ("Home", -MAX_PARALLEL_JOBS), ("End", MAX_PARALLEL_JOBS)):
+            self.bind(f"<{key}>", lambda event, delta=step: self.step(delta))
+
+    def bounds(self):
+        left = self.radius + 2
+        return left, max(left + 1, self.winfo_width() - left)
+
+    def redraw(self, *_):
+        left, right = self.bounds()
+        y = self.winfo_height() / 2
+        value = self.drag_value if self.drag_value is not None else self.variable.get()
+        x = left + (right - left) * (value - 1) / (MAX_PARALLEL_JOBS - 1)
+        radius = self.radius
+        enabled = self.cget("state") != "disabled"
+        accent = ACCENT if enabled else MUTED
+        self.delete("all")
+        self.create_line(left, y, right, y, fill=BORDER, width=max(4, radius // 2), capstyle="round")
+        self.create_line(left, y, x, y, fill=accent, width=max(4, radius // 2), capstyle="round")
+        if self.focus_get() == self or self.drag_value is not None:
+            halo = radius + 3
+            self.create_oval(x - halo, y - halo, x + halo, y + halo, fill=SELECTED, outline="")
+        self.create_oval(x - radius, y - radius, x + radius, y + radius, fill=accent, outline="")
+
+    def drag(self, event):
+        if self.cget("state") == "disabled":
+            return
+        self.focus_set()
+        left, right = self.bounds()
+        fraction = max(0, min(1, (event.x - left) / (right - left)))
+        self.drag_value = 1 + fraction * (MAX_PARALLEL_JOBS - 1)
+        self.variable.set(round(self.drag_value))
+
+    def release(self, event):
+        self.drag(event)
+        self.drag_value = None
+        self.redraw()
+
+    def step(self, delta):
+        if self.cget("state") != "disabled":
+            value = self.variable.get() + delta
+            self.variable.set(max(1, min(MAX_PARALLEL_JOBS, value)))
+        return "break"
+
+
 class MusicCrawlerWindow:
     def __init__(self, root):
         self.root = root
         self.events = SimpleQueue()
         self.running = False
         self.output_dir = DEFAULT_OUTPUT_DIR
+        self.parallel_jobs = DEFAULT_PARALLEL_JOBS
         self.status = tk.StringVar(value="就绪")
         self.progress = tk.StringVar(value="")
         root.title("AI Music Crawler")
@@ -193,11 +271,20 @@ class MusicCrawlerWindow:
 
         logs = self.card(panels)
         logs.grid(row=0, column=1, sticky="nsew")
-        label(logs, "运行日志", size=13, bold=True).pack(fill="x", padx=14, pady=(13, 2))
+        log_header = tk.Frame(logs, bg=WHITE)
+        log_header.pack(fill="x", padx=14, pady=(10, 3))
+        label(log_header, "运行日志", size=13, bold=True).pack(side="left")
+        ttk.Button(log_header, text="查看文件", style="Outline.TButton",
+                   command=self.open_log).pack(side="right")
+        ttk.Button(log_header, text="复制", style="Outline.TButton",
+                   command=self.copy_log).pack(side="right", padx=(0, 6))
         tk.Label(logs, textvariable=self.progress, anchor="w", bg=WHITE, fg=MUTED,
                  font=(FONT, 9)).pack(fill="x", padx=14, pady=(0, 10))
         output, self.log = self.text_box(logs, height=5, bg=LOG_BACKGROUND, fg="#D9E7F7")
         output.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+        self.log.tag_configure("downloaded", foreground=ACCENT)
+        self.log.tag_configure("skipped", foreground="#B5CBF3")
+        self.log.tag_configure("failed", foreground="#FFAAA7")
         self.log.configure(state="disabled")
         return page
 
@@ -210,12 +297,10 @@ class MusicCrawlerWindow:
         panel.pack(fill="x")
         body = tk.Frame(panel, bg=WHITE)
         body.pack(fill="x", padx=20, pady=19)
-        self.api_key = tk.StringVar()
         self.cookie = tk.StringVar()
         self.visible = tk.BooleanVar()
         self.fields = []
         for title, hint, variable in (
-            ("DeepSeek API Key", "用于让 DeepSeek 从搜索结果中选择音源。", self.api_key),
             ("B 站 Cookie（可选）", "需要使用登录会话时，粘贴完整 Cookie，保持单行。", self.cookie),
         ):
             label(body, title, size=12, bold=True).pack(fill="x")
@@ -234,6 +319,15 @@ class MusicCrawlerWindow:
                    command=self.choose_output).pack(side="left", padx=(8, 0))
         ttk.Button(folder_row, text="恢复默认", style="Outline.TButton",
                    command=lambda: self.folder_selection.set(str(DEFAULT_OUTPUT_DIR))).pack(side="left", padx=(8, 0))
+
+        slider_header = tk.Frame(body, bg=WHITE)
+        slider_header.pack(fill="x")
+        label(slider_header, "并发任务数", size=12, bold=True).pack(side="left")
+        self.parallel_selection = tk.IntVar(value=self.parallel_jobs)
+        tk.Label(slider_header, textvariable=self.parallel_selection, bg=SELECTED, fg=ACCENT,
+                 font=(FONT, 10, "bold"), padx=9, pady=3).pack(side="right")
+        self.parallel_slider = ParallelSlider(body, self.parallel_selection)
+        self.parallel_slider.pack(fill="x", pady=(4, 12))
 
         buttons = tk.Frame(body, bg=WHITE)
         buttons.pack(fill="x")
@@ -254,16 +348,15 @@ class MusicCrawlerWindow:
 
     def load_files(self):
         try:
-            if KEYWORD_FILE.is_file():
-                self.editor.insert("1.0", KEYWORD_FILE.read_text(encoding="utf-8-sig"))
             config = read_local_config()
+            self.parallel_jobs = parse_parallel_jobs(config.get("PARALLEL_JOBS"))
+            self.parallel_selection.set(self.parallel_jobs)
             if configured_dir := config.get("DOWNLOAD_DIR"):
                 self.output_dir = APP_DIR / configured_dir
             self.folder_selection.set(str(self.output_dir))
-            self.api_key.set(config.get("DEEPSEEK_API_KEY", ""))
             self.cookie.set(config.get("BILIBILI_COOKIE", ""))
         except (OSError, UnicodeError):
-            self.append_log("无法读取本地配置或关键词文件，请检查文件权限和 UTF-8 编码。\n")
+            self.append_log("无法读取本地配置，请检查文件权限和 UTF-8 编码。\n")
 
     def open_bilibili(self):
         url = "https://www.bilibili.com/"
@@ -293,8 +386,8 @@ class MusicCrawlerWindow:
         selected = Path(self.folder_selection.get())
         try:
             save_credentials(
-                self.api_key.get(), self.cookie.get(),
-                download_dir="" if selected == DEFAULT_OUTPUT_DIR else str(selected),
+                self.cookie.get(), download_dir="" if selected == DEFAULT_OUTPUT_DIR else str(selected),
+                parallel_jobs=self.parallel_selection.get(),
             )
         except ValueError:
             messagebox.showerror("设置未保存", "每项凭据必须是单行文本。", parent=self.root)
@@ -303,20 +396,19 @@ class MusicCrawlerWindow:
             messagebox.showerror("设置未保存", "无法写入配置。请检查程序所在目录的读写权限。", parent=self.root)
             return
         self.output_dir = selected
+        self.parallel_jobs = self.parallel_selection.get()
         self.settings_status.set("已保存到本机。")
         self.visible.set(False)
         self.toggle_visibility()
 
-    def save_keywords(self, *, announce=True):
+    def save_keywords(self):
         text = self.editor.get("1.0", "end-1c")
         try:
             write_local_text(KEYWORD_FILE, text.rstrip() + "\n" if text.strip() else "")
         except OSError:
             messagebox.showerror("关键词未保存", "无法写入 keywords.txt，请检查目录权限。", parent=self.root)
             return None
-        if announce:
-            self.append_log("已保存 keywords.txt。\n")
-        return [line.strip() for line in text.splitlines() if line.strip()]
+        self.append_log("已保存 keywords.txt。\n")
 
     def open_output(self):
         try:
@@ -328,21 +420,14 @@ class MusicCrawlerWindow:
     def start(self):
         if self.running:
             return
-        keywords = self.save_keywords(announce=False)
-        if keywords is None:
-            return
+        keywords = [line.strip() for line in self.editor.get("1.0", "end-1c").splitlines() if line.strip()]
         if not keywords:
             messagebox.showinfo("需要关键词", "请至少输入一条关键词。", parent=self.root)
             return
         try:
-            api_key = get_config("DEEPSEEK_API_KEY")
             cookie = get_config("BILIBILI_COOKIE")
         except (OSError, UnicodeError):
             messagebox.showerror("无法读取配置", "请检查 secrets.txt 的读取权限和 UTF-8 编码。", parent=self.root)
-            return
-        if not api_key:
-            messagebox.showinfo("需要 API Key", "请在设置中填写并保存 DeepSeek API Key。", parent=self.root)
-            self.show("settings")
             return
         if not ffmpeg_command():
             messagebox.showinfo("缺少 FFmpeg", "请将 ffmpeg.exe 放在程序旁边，或将 FFmpeg 加入 PATH。", parent=self.root)
@@ -362,14 +447,17 @@ class MusicCrawlerWindow:
         self.log.delete("1.0", "end")
         self.log.configure(state="disabled")
         self.append_log(f"保存目录：{output_dir}\n")
-        Thread(target=self.run_task, args=(keywords, api_key, cookie, output_dir), daemon=True).start()
+        Thread(target=self.run_task, args=(keywords, cookie, output_dir, self.parallel_jobs), daemon=True).start()
 
-    def run_task(self, keywords, api_key, cookie, output_dir):
+    def run_task(self, keywords, cookie, output_dir, parallel_jobs):
         cookie_values = [part.partition("=")[2].strip() for part in cookie.split(";")]
-        stream = TaskOutput(self.events, (api_key, cookie, *(v for v in cookie_values if len(v) >= 8)))
+        stream = TaskOutput(self.events, (cookie, *(v for v in cookie_values if len(v) >= 8)))
         try:
             with redirect_stdout(stream), redirect_stderr(stream):
-                result = run_keywords(keywords, api_key, output_dir)
+                result = run_keywords(
+                    keywords, output_dir, parallel_jobs=parallel_jobs,
+                    on_result=lambda *counts: self.events.put(("result", counts)),
+                )
             self.events.put(("complete", result))
         except Exception as error:
             self.events.put(("error", f"任务异常结束（{type(error).__name__}）。"))
@@ -380,16 +468,38 @@ class MusicCrawlerWindow:
         for button in (self.start_button, self.save_button, self.save_settings_button):
             button.configure(state=state)
         self.editor.configure(state=state)
+        self.parallel_slider.configure(state=state)
+        self.parallel_slider.redraw()
         if running:
             self.status.set("运行中")
             self.progress.set("正在处理关键词…")
 
+    def copy_log(self):
+        text = self.log.get("1.0", "end-1c")
+        if text:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+
+    def open_log(self):
+        if not LOG_FILE.is_file():
+            messagebox.showinfo("运行日志", "还没有生成日志文件。", parent=self.root)
+            return
+        try:
+            os.startfile(LOG_FILE)
+        except OSError:
+            messagebox.showerror("无法打开日志", str(LOG_FILE), parent=self.root)
+
     def append_log(self, text):
+        follow = self.log.yview()[1] >= 0.999
         self.log.configure(state="normal")
-        self.log.insert("end", text)
+        colors = {"[已下载]": "downloaded", "[已跳过]": "skipped", "[失败]": "failed"}
+        for line in text.splitlines(keepends=True):
+            tag = next((color for marker, color in colors.items() if marker in line), "")
+            self.log.insert("end", line, tag)
         if int(self.log.index("end-1c").split(".")[0]) > 1600:
             self.log.delete("1.0", "201.0")
-        self.log.see("end")
+        if follow:
+            self.log.see("end")
         self.log.configure(state="disabled")
 
     def drain_events(self):
@@ -407,11 +517,13 @@ class MusicCrawlerWindow:
                 pending.clear()
             if kind == "progress":
                 self.progress.set(value)
+            elif kind == "result":
+                downloaded, skipped, failed, total = value
+                self.status.set(f"{downloaded + skipped + failed}/{total}  ·  下载 {downloaded}  ·  跳过 {skipped}  ·  失败 {failed}")
             else:
                 self.set_running(False)
                 if kind == "complete":
                     success, failed = value
-                    self.status.set(f"成功 {success} · 失败 {failed}")
                     self.progress.set("点击「打开保存目录」查看音频。" if success else "请查看上方日志中的失败原因。")
                 else:
                     self.status.set("任务失败")
